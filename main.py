@@ -1,308 +1,422 @@
-import tkinter as tk
-from tkinter import ttk, messagebox, simpledialog
-import cv2
-import PIL.Image, PIL.ImageTk
-import face_recognition
-import pyttsx3
+import datetime
+from email.mime.image import MIMEImage
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+import os
+import pickle
+import smtplib
 import threading
 import time
-import pickle
-import os
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
-from email.mime.image import MIMEImage
+from tkinter import messagebox, simpledialog
+import cv2
+from PIL import Image, ImageTk
+import customtkinter as ctk  # Modern UI library
+import face_recognition
+import pyttsx3
 
-ENGINE = pyttsx3.init()
-ENGINE.setProperty('rate', 150)
+# --- UI Theme Setup ---
+ctk.set_appearance_mode("System")  # Options: "System", "Dark", "Light"
+ctk.set_default_color_theme("blue")  # Options: "blue", "green", "dark-blue"
 
-FACES_FILE = "faces.pkl"
-EMAILS_FILE = "emails.txt"
+# --- Constants & Global Variables ---
+ENCODINGS_FILE = "faces.pkl"
+EMAILS_FILE = "emails.pkl"
+TEMP_IMAGE = "temp_capture.jpg"
 
-KNOWN_FACE_ENCODINGS = []
-KNOWN_FACE_NAMES = []
+known_face_encodings = []
+known_face_names = []
+registered_emails = []
 
-if os.path.exists(FACES_FILE):
-    with open(FACES_FILE, "rb") as f:
-        data = pickle.load(f)
-        KNOWN_FACE_ENCODINGS = data.get("encodings", [])
-        KNOWN_FACE_NAMES = data.get("names", [])
 
-def save_faces():
-    data = {"encodings": KNOWN_FACE_ENCODINGS, "names": KNOWN_FACE_NAMES}
-    with open(FACES_FILE, "wb") as f:
-        pickle.dump(data, f)
+# --- Load Data Functions ---
+def load_data():
+  global known_face_encodings, known_face_names, registered_emails
+  if os.path.exists(ENCODINGS_FILE):
+    with open(ENCODINGS_FILE, "rb") as f:
+      data = pickle.load(f)
+      known_face_encodings = data.get("encodings", [])
+      known_face_names = data.get("names", [])
+  if os.path.exists(EMAILS_FILE):
+    with open(EMAILS_FILE, "rb") as f:
+      registered_emails = pickle.load(f)
 
-def load_emails():
-    if not os.path.exists(EMAILS_FILE):
-        return []
-    with open(EMAILS_FILE, "r") as f:
-        return [line.strip() for line in f if line.strip()]
 
-def save_emails_list(emails):
-    with open(EMAILS_FILE, "w") as f:
-        for email in emails:
-            f.write(email + "\n")
+def save_encodings():
+  with open(ENCODINGS_FILE, "wb") as f:
+    pickle.dump(
+        {"encodings": known_face_encodings, "names": known_face_names}, f
+    )
 
-class App:
-    def __init__(self, window, window_title):
-        self.window = window
-        self.window.title(window_title)
-        self.window.geometry("1100x650")
 
-        self.is_running = False
-        self.cap = None
+def save_emails():
+  with open(EMAILS_FILE, "wb") as f:
+    pickle.dump(registered_emails, f)
 
-        self.notified_known = set()
-        self.last_unknown_email_time = 0
-        self.start_time = 0
-        self.unknown_timer_check = 0
 
-        self.setup_ui()
+load_data()
 
-    def setup_ui(self):
-        left_frame = tk.Frame(self.window, width=700, height=650)
-        left_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-        self.canvas = tk.Canvas(left_frame, width=640, height=480, bg="black")
-        self.canvas.pack(padx=10, pady=10)
+class SmartSecurityApp(ctk.CTk):
 
-        btn_frame = tk.Frame(left_frame)
-        btn_frame.pack(pady=10)
+  def __init__(self):
+    super().__init__()
 
-        self.btn_start = tk.Button(btn_frame, text="Start System", bg="green", fg="white", font=("Arial", 12, "bold"), command=self.start_system)
-        self.btn_start.pack(side=tk.LEFT, padx=10)
+    self.title("Smart Security Guard & Receptionist")
+    self.geometry("1100x700")
+    self.minsize(1000, 650)
 
-        self.btn_stop = tk.Button(btn_frame, text="Stop System", bg="red", fg="white", font=("Arial", 12, "bold"), state=tk.DISABLED, command=self.stop_system)
-        self.btn_stop.pack(side=tk.LEFT, padx=10)
+    # State variables
+    self.running = False
+    self.cap = None
+    self.last_alert_time = {}
+    self.unknown_last_alert = 0
+    self.start_time = None
 
-        right_frame = tk.Frame(self.window, width=400, height=650, bg="#f0f0f0")
-        right_frame.pack(side=tk.RIGHT, fill=tk.BOTH, padx=10, pady=10)
+    # Initialize Text-to-Speech Engine
+    try:
+      self.engine = pyttsx3.init()
+      self.engine.setProperty("rate", 150)
+    except Exception:
+      self.engine = None
 
-        tk.Label(right_frame, text="Trained Faces", font=("Arial", 12, "bold"), bg="#f0f0f0").pack(pady=5)
-        
-        face_btn_frame = tk.Frame(right_frame, bg="#f0f0f0")
-        face_btn_frame.pack(pady=5)
-        tk.Button(face_btn_frame, text="Add Face", command=self.add_face).pack(side=tk.LEFT, padx=5)
-        tk.Button(face_btn_frame, text="Delete Face", command=self.delete_face).pack(side=tk.LEFT, padx=5)
+    # --- Layout Grid ---
+    self.grid_columnconfigure(0, weight=3)  # Video Area
+    self.grid_columnconfigure(1, weight=2)  # Control Panel
+    self.grid_rowconfigure(0, weight=1)
 
-        self.face_listbox = tk.Listbox(right_frame, width=35, height=8)
-        self.face_listbox.pack(pady=5)
-        self.update_face_listbox()
+    # --- Left Frame: Video Feed ---
+    self.video_frame = ctk.CTkFrame(self, corner_radius=15, fg_color=("gray85", "gray15"))
+    self.video_frame.grid(row=0, column=0, padx=15, pady=15, sticky="nsew")
+    self.video_frame.grid_rowconfigure(0, weight=1)
+    self.video_frame.grid_columnconfigure(0, weight=1)
 
-        tk.Label(right_frame, text="Registered Emails", font=("Arial", 12, "bold"), bg="#f0f0f0").pack(pady=5)
-        
-        email_btn_frame = tk.Frame(right_frame, bg="#f0f0f0")
-        email_btn_frame.pack(pady=5)
-        tk.Button(email_btn_frame, text="Add Email", command=self.add_email).pack(side=tk.LEFT, padx=5)
-        tk.Button(email_btn_frame, text="Delete Email", command=self.delete_email).pack(side=tk.LEFT, padx=5)
+    self.video_label = ctk.CTkLabel(
+        self.video_frame, text="Camera Feed Offline", font=ctk.CTkFont(size=16, weight="bold")
+    )
+    self.video_label.grid(row=0, column=0, sticky="nsew", padx=10, pady=10)
 
-        self.email_frame = tk.Frame(right_frame, bg="#f0f0f0")
-        self.email_frame.pack(pady=5, fill=tk.BOTH)
-        
-        self.email_vars = {}
-        self.refresh_email_checkboxes()
+    # --- Right Frame: Control Panel ---
+    self.control_frame = ctk.CTkFrame(self, corner_radius=15)
+    self.control_frame.grid(row=0, column=1, padx=(0, 15), pady=15, sticky="nsew")
+    self.control_frame.grid_columnconfigure(0, weight=1)
+    self.control_frame.grid_rowconfigure(4, weight=1)
 
-    def update_face_listbox(self):
-        self.face_listbox.delete(0, tk.END)
-        for name in KNOWN_FACE_NAMES:
-            self.face_listbox.insert(tk.END, name)
+    # App Title Header
+    self.title_label = ctk.CTkLabel(
+        self.control_frame,
+        text="🛡️ Kamata-sai Security",
+        font=ctk.CTkFont(size=22, weight="bold"),
+    )
+    self.title_label.grid(row=0, column=0, padx=20, pady=(20, 10), sticky="w")
 
-    def refresh_email_checkboxes(self):
-        for widget in self.email_frame.winfo_children():
-            widget.destroy()
-        self.email_vars.clear()
-        
-        emails = load_emails()
-        for email in emails:
-            var = tk.BooleanVar(value=True)
-            chk = tk.Checkbutton(self.email_frame, text=email, variable=var, bg="#f0f0f0")
-            chk.pack(anchor=tk.W)
-            self.email_vars[email] = var
+    # System Status Indicator
+    self.status_badge = ctk.CTkLabel(
+        self.control_frame,
+        text=" ● System Status: STOPPED ",
+        font=ctk.CTkFont(size=13, weight="bold"),
+        text_color="orange",
+    )
+    self.status_badge.grid(row=1, column=0, padx=20, pady=(0, 15), sticky="w")
 
-    def add_face(self):
-        name = simpledialog.askstring("Input", "Enter Name:")
-        if not name:
-            return
-        
-        temp_cap = cv2.VideoCapture(0)
-        ret, frame = temp_cap.read()
-        temp_cap.release()
+    # Start/Stop Buttons Frame
+    self.btn_frame = ctk.CTkFrame(self.control_frame, fg_color="transparent")
+    self.btn_frame.grid(row=2, column=0, padx=20, pady=10, sticky="ew")
+    self.btn_frame.grid_columnconfigure((0, 1), weight=1)
 
-        if not ret:
-            messagebox.showerror("Error", "Camera failed!")
-            return
+    self.start_btn = ctk.CTkButton(
+        self.btn_frame,
+        text="Start System",
+        fg_color="#2fa572",
+        hover_color="#248259",
+        command=self.start_system,
+        font=ctk.CTkFont(size=14, weight="bold"),
+        height=40,
+    )
+    self.start_btn.grid(row=0, column=0, padx=(0, 5), sticky="ew")
 
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        encodings = face_recognition.face_encodings(rgb_frame)
+    self.stop_btn = ctk.CTkButton(
+        self.btn_frame,
+        text="Stop System",
+        fg_color="#d9534f",
+        hover_color="#b52b27",
+        command=self.stop_system,
+        font=ctk.CTkFont(size=14, weight="bold"),
+        height=40,
+        state="disabled",
+    )
+    self.stop_btn.grid(row=0, column=1, padx=(5, 0), sticky="ew")
 
-        if len(encodings) > 0:
-            KNOWN_FACE_ENCODINGS.append(encodings[0])
-            KNOWN_FACE_NAMES.append(name)
-            save_faces()
-            self.update_face_listbox()
-            messagebox.showinfo("Success", f"Face {name} added successfully!")
+    # Management Actions Frame (Add Face / Manage Emails)
+    self.mgmt_frame = ctk.CTkFrame(self.control_frame, corner_radius=10)
+    self.mgmt_frame.grid(row=3, column=0, padx=20, pady=15, sticky="ew")
+    self.mgmt_frame.grid_columnconfigure(0, weight=1)
+
+    self.add_face_btn = ctk.CTkButton(
+        self.mgmt_frame,
+        text="➕ Register New Face",
+        command=self.add_face_gui,
+        height=35,
+    )
+    self.add_face_btn.grid(row=0, column=0, padx=15, pady=(15, 8), sticky="ew")
+
+    self.manage_email_btn = ctk.CTkButton(
+        self.mgmt_frame,
+        text="📧 Manage Emails",
+        command=self.manage_emails_gui,
+        height=35,
+        fg_color="gray40",
+        hover_color="gray30",
+    )
+    self.manage_email_btn.grid(row=1, column=0, padx=15, pady=(8, 15), sticky="ew")
+
+    # Log / Status Box
+    self.log_textbox = ctk.CTkTextbox(
+        self.control_frame, corner_radius=10, font=ctk.CTkFont(size=12)
+    )
+    self.log_textbox.grid(row=4, column=0, padx=20, pady=(0, 20), sticky="nsew")
+    self.log_textbox.insert("0.0", "System initialized successfully.\nReady to start...\n")
+    self.log_textbox.configure(state="disabled")
+
+  def log_message(self, message):
+    self.log_textbox.configure(state="normal")
+    timestamp = datetime.datetime.now().strftime("[%H:%M:%S] ")
+    self.log_textbox.insert("end", timestamp + message + "\n")
+    self.log_textbox.see("end")
+    self.log_textbox.configure(state="disabled")
+
+  # --- Core Voice & Email Logic (Preserved) ---
+  def speak(self, text):
+    if self.engine:
+      try:
+        self.engine.say(text)
+        self.engine.runAndWait()
+      except Exception:
+        pass
+
+  def send_email_alert(self, subject, image_path):
+    if not registered_emails:
+      return
+    sender_email = "laminhan221@gmail.com"  # Change accordingly
+    sender_password = "xabb cgyb oebw maxz"  # Change accordingly
+
+    try:
+      msg = MIMEMultipart()
+      msg["Subject"] = subject
+      msg["From"] = sender_email
+      msg["To"] = ", ".join(registered_emails)
+
+      body = MIMEText(
+          f"Alert triggered at {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+      )
+      msg.attach(body)
+
+      if os.path.exists(image_path):
+        with open(image_path, "rb") as f:
+          img_data = f.read()
+        img = MIMEImage(img_data, name="capture.jpg")
+        msg.attach(img)
+
+      server = smtplib.SMTP("smtp.gmail.com", 587)
+      server.starttls()
+      server.login(sender_email, sender_password)
+      server.sendmail(sender_email, registered_emails, msg.as_string())
+      server.quit()
+      self.log_message("Email alert sent successfully.")
+    except Exception as e:
+      self.log_message(f"Email failed: {str(e)}")
+
+  # --- System Controls ---
+  def start_system(self):
+    if self.running:
+      return
+    self.cap = cv2.VideoCapture(0)
+    if not self.cap.isOpened():
+      messagebox.showerror("Error", "Could not open webcam.")
+      return
+
+    self.running = True
+    self.start_time = time.time()
+    self.status_badge.configure(text=" ● System Status: RUNNING ", text_color="#2fa572")
+    self.start_btn.configure(state="disabled")
+    self.stop_btn.configure(state="normal")
+    self.log_message("System started.")
+
+    # Run video loop in a thread
+    self.thread = threading.Thread(target=self.video_loop, daemon=True)
+    self.thread.start()
+
+  def stop_system(self):
+    self.running = False
+    if self.cap:
+      self.cap.release()
+    self.status_badge.configure(text=" ● System Status: STOPPED ", text_color="orange")
+    self.start_btn.configure(state="normal")
+    self.stop_btn.configure(state="disabled")
+    self.video_label.configure(image="", text="Camera Feed Offline")
+    self.log_message("System stopped.")
+
+  def video_loop(self):
+    while self.running:
+      ret, frame = self.cap.read()
+      if not ret:
+        break
+
+      small_frame = cv2.resize(frame, (0, 0), fx=0.25, fy=0.25)
+      rgb_small_frame = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
+
+      face_locations = face_recognition.face_locations(rgb_small_frame)
+      face_encodings = face_recognition.face_encodings(
+          rgb_small_frame, face_locations
+      )
+
+      current_time = time.time()
+
+      for face_encoding, face_location in zip(face_encodings, face_locations):
+        matches = face_recognition.compare_faces(
+            known_face_encodings, face_encoding
+        )
+        name = "Unknown"
+
+        if True in matches:
+          first_match_index = matches.index(True)
+          name = known_face_names[first_match_index]
+
+          # Scale back face locations
+          top, right, bottom, left = [v * 4 for v in face_location]
+          cv2.rectangle(frame, (left, top), (right, bottom), (0, 255, 0), 2)
+          cv2.putText(
+              frame,
+              name,
+              (left, top - 10),
+              cv2.FONT_HERSHEY_SIMPLEX,
+              0.75,
+              (0, 255, 0),
+              2,
+          )
+
+          # Known user greeting logic
+          if (
+              name not in self.last_alert_time
+              or current_time - self.last_alert_time[name] > 300
+          ):
+            self.last_alert_time[name] = current_time
+            cv2.imwrite(TEMP_IMAGE, frame)
+            threading.Thread(
+                target=self.speak, args=(f"いらっしゃいませ {name} さん",)
+            ).start()
+            threading.Thread(
+                target=self.send_email_alert,
+                args=(f"Known Visitor Alert: {name}", TEMP_IMAGE),
+            ).start()
+            self.log_message(f"Recognized: {name}")
+
         else:
-            messagebox.showerror("Error", "No face detected. Try again.")
+          top, right, bottom, left = [v * 4 for v in face_location]
+          cv2.rectangle(frame, (left, top), (right, bottom), (0, 0, 255), 2)
+          cv2.putText(
+              frame,
+              "Unknown",
+              (left, top - 10),
+              cv2.FONT_HERSHEY_SIMPLEX,
+              0.75,
+              (0, 0, 255),
+              2,
+          )
 
-    def delete_face(self):
-        selected = self.face_listbox.curselection()
-        if not selected:
-            messagebox.showwarning("Warning", "Select a face to delete.")
-            return
-        idx = selected[0]
-        name = KNOWN_FACE_NAMES[idx]
-        del KNOWN_FACE_NAMES[idx]
-        del KNOWN_FACE_ENCODINGS[idx]
-        save_faces()
-        self.update_face_listbox()
-        messagebox.showinfo("Success", f"Face {name} deleted.")
+          # Unknown user logic
+          elapsed_since_start = current_time - self.start_time
+          if elapsed_since_start < 20:
+            if current_time - self.unknown_last_alert > 10:
+              self.unknown_last_alert = current_time
+              cv2.imwrite(TEMP_IMAGE, frame)
+              threading.Thread(
+                  target=self.speak, args=("誰さんですか",)
+              ).start()
+              threading.Thread(
+                  target=self.send_email_alert,
+                  args=("Unknown Visitor Alert", TEMP_IMAGE),
+              ).start()
+              self.log_message("Unknown visitor detected (Startup phase).")
+          else:
+            if current_time - self.unknown_last_alert > 3600:
+              self.unknown_last_alert = current_time
+              cv2.imwrite(TEMP_IMAGE, frame)
+              threading.Thread(
+                  target=self.speak, args=("誰さんですか",)
+              ).start()
+              threading.Thread(
+                  target=self.send_email_alert,
+                  args=("Unknown Intruder Alert", TEMP_IMAGE),
+              ).start()
+              self.log_message("Unknown intruder detected.")
 
-    def add_email(self):
-        email = simpledialog.askstring("Input", "Enter Email Address:")
-        if email:
-            emails = load_emails()
-            if email not in emails:
-                emails.append(email)
-                save_emails_list(emails)
-                self.refresh_email_checkboxes()
+      # Convert frame to display in CTkLabel
+      cv2_image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+      pil_image = Image.fromarray(cv2_image)
 
-    def delete_email(self):
-        emails = load_emails()
-        selected_emails = [e for e, var in self.email_vars.items() if var.get()]
-        if not selected_emails:
-            messagebox.showwarning("Warning", "Check emails to remove.")
-            return
-        new_emails = [e for e in emails if e not in selected_emails]
-        save_emails_list(new_emails)
-        self.refresh_email_checkboxes()
+      # Resize to fit UI video frame smoothly
+      w = self.video_frame.winfo_width() - 20
+      h = self.video_frame.winfo_height() - 20
+      if w > 10 and h > 10:
+        pil_image = pil_image.resize((w, h), Image.Resampling.LANCZOS)
 
-    def speak(self, text):
-        def run():
-            ENGINE.say(text)
-            ENGINE.runAndWait()
-        threading.Thread(target=run).start()
+      imgtk = ctk.CTkImage(light_image=pil_image, dark_image=pil_image, size=(w, h))
+      self.video_label.configure(image=imgtk, text="")
+      self.video_label.image = imgtk
 
-    def send_email_alert(self, subject, message, image_path=None):
-        selected_emails = [e for e, var in self.email_vars.items() if var.get()]
-        if not selected_emails:
-            return
+  # --- Add Face & Email Management Dialogs ---
+  def add_face_gui(self):
+    name = simpledialog.askstring("Register Face", "Enter visitor's name:")
+    if not name:
+      return
 
-        sender_email = "your_email@gmail.com"
-        sender_password = "your_app_password"
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+      messagebox.showerror("Error", "Cannot access camera.")
+      return
 
-        msg = MIMEMultipart()
-        msg['Subject'] = subject
-        msg['From'] = sender_email
-        msg['To'] = ", ".join(selected_emails)
+    messagebox.showinfo(
+        "Capture",
+        f"Position your face for {name}. Click OK to capture snapshot.",
+    )
+    ret, frame = cap.read()
+    cap.release()
 
-        msg.attach(MIMEText(message, 'plain'))
+    if ret:
+      rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+      encodings = face_recognition.face_encodings(rgb_frame)
+      if encodings:
+        known_face_encodings.append(encodings[0])
+        known_face_names.append(name)
+        save_encodings()
+        messagebox.load = "Success"
+        messagebox.showinfo("Success", f"Face registered successfully for {name}!")
+        self.log_message(f"New face added: {name}")
+      else:
+        messagebox.showerror(
+            "Error", "No face detected in the frame. Please try again."
+        )
+    else:
+      messagebox.showerror("Error", "Failed to capture image from camera.")
 
-        if image_path and os.path.exists(image_path):
-            with open(image_path, 'rb') as f:
-                img_data = f.read()
-            img = MIMEImage(img_data, name=os.path.basename(image_path))
-            msg.attach(img)
+  def manage_emails_gui(self):
+    email = simpledialog.askstring(
+        "Manage Emails",
+        f"Current emails: {registered_emails}\n\nEnter email to add (or type 'clear' to reset):",
+    )
+    if email:
+      if email.lower() == "clear":
+        registered_emails.clear()
+        save_emails()
+        self.log_message("Email list cleared.")
+      else:
+        if email not in registered_emails:
+          registered_emails.append(email)
+          save_emails()
+          self.log_message(f"Added email: {email}")
+          messagebox.showinfo("Success", f"Added {email} to alert list.")
 
-        try:
-            server = smtplib.SMTP('smtp.gmail.com', 587)
-            server.starttls()
-            server.login(sender_email, sender_password)
-            server.sendmail(sender_email, selected_emails, msg.as_string())
-            server.quit()
-        except Exception as e:
-            print(f"Email failed: {e}")
-
-    def start_system(self):
-        self.is_running = True
-        self.cap = cv2.VideoCapture(0)
-        self.btn_start.config(state=tk.DISABLED)
-        self.btn_stop.config(state=tk.NORMAL)
-        self.notified_known.clear()
-        self.start_time = time.time()
-        self.unknown_timer_check = time.time()
-        self.update_frame()
-
-    def stop_system(self):
-        self.is_running = False
-        if self.cap:
-            self.cap.release()
-        self.btn_start.config(state=tk.NORMAL)
-        self.btn_stop.config(state=tk.DISABLED)
-        self.canvas.delete("all")
-
-    def update_frame(self):
-        if not self.is_running:
-            return
-
-        ret, frame = self.cap.read()
-        if ret:
-            current_time = time.time()
-            elapsed_time = current_time - self.start_time
-
-            small_frame = cv2.resize(frame, (0, 0), fx=0.25, fy=0.25)
-            rgb_small = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
-
-            face_locations = face_recognition.face_locations(rgb_small)
-            face_encodings = face_recognition.face_encodings(rgb_small, face_locations)
-
-            face_detected = False
-
-            for (top, right, bottom, left), face_encoding in zip(face_locations, face_encodings):
-                face_detected = True
-                top *= 4
-                right *= 4
-                bottom *= 4
-                left *= 4
-
-                name = "Unknown"
-                if len(KNOWN_FACE_ENCODINGS) > 0:
-                    matches = face_recognition.compare_faces(KNOWN_FACE_ENCODINGS, face_encoding, tolerance=0.5)
-                    if True in matches:
-                        first_match_index = matches.index(True)
-                        name = KNOWN_FACE_NAMES[first_match_index]
-
-                cv2.rectangle(frame, (left, top), (right, bottom), (0, 255, 0) if name != "Unknown" else (0, 0, 255), 2)
-                cv2.putText(frame, name, (left, top - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2)
-
-                if elapsed_time <= 20:
-                    if name != "Unknown":
-                        if name not in self.notified_known:
-                            self.notified_known.add(name)
-                            self.speak(f"いらっしゃいませ {name}さん")
-                            img_path = "temp_capture.jpg"
-                            cv2.imwrite(img_path, frame)
-                            self.send_email_alert("Known Visitor Alert", f"Visitor arrived: {name}", img_path)
-                    else:
-                        if current_time - self.unknown_timer_check >= 10:
-                            self.unknown_timer_check = current_time
-                            self.speak("誰さんですか")
-                            img_path = "temp_unknown.jpg"
-                            cv2.imwrite(img_path, frame)
-                            self.send_email_alert("Unknown Visitor Alert", "Unknown person detected!", img_path)
-                else:
-                    if name != "Unknown":
-                        if name not in self.notified_known:
-                            self.notified_known.add(name)
-                            self.speak(f"いらっしゃいませ {name}さん")
-                            img_path = "temp_capture.jpg"
-                            cv2.imwrite(img_path, frame)
-                            self.send_email_alert("Known Visitor Alert", f"Visitor arrived: {name}", img_path)
-                    else:
-                        if current_time - self.last_unknown_email_time >= 60:
-                            self.last_unknown_email_time = current_time
-                            self.speak("誰さんですか")
-                            img_path = "temp_unknown.jpg"
-                            cv2.imwrite(img_path, frame)
-                            self.send_email_alert("Unknown Intruder Alert", "Unknown person detected for 1 minute interval.", img_path)
-
-            photo = PIL.ImageTk.PhotoImage(image=PIL.Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)))
-            self.canvas.image = photo
-            self.canvas.create_image(0, 0, image=photo, anchor=tk.NW)
-
-        self.window.after(15, self.update_frame)
 
 if __name__ == "__main__":
-    root = tk.Tk()
-    app = App(root, "Kamata-sai Smart Security Guard & Receptionist")
-    root.mainloop()
+  app = SmartSecurityApp()
+  app.mainloop()

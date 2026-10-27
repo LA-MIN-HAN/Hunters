@@ -8,11 +8,13 @@ import smtplib
 import threading
 import time
 from tkinter import messagebox
+from gtts import gTTS
 import cv2
+import numpy as np
 from PIL import Image, ImageTk
+from playsound import playsound  # Silent background audio without opening media player
 import customtkinter as ctk
 import face_recognition
-import pyttsx3
 
 # --- UI Theme Setup ---
 ctk.set_appearance_mode("System")
@@ -76,7 +78,7 @@ class SmartSecurityApp(ctk.CTk):
   def __init__(self):
     super().__init__()
 
-    self.title("Smart Security Guard & Receptionist")
+    self.title("Smart Security Guard & Receptionist (Playsound Audio)")
     self.geometry("1150x720")
     self.minsize(1050, 680)
 
@@ -87,16 +89,8 @@ class SmartSecurityApp(ctk.CTk):
     self.last_unknown_email_time = 0
     self.start_time = None
 
-    # Track session-based alerts to strictly prevent duplicate emails/voice for known users
     self.welcomed_registered_users = set()
     self.emailed_registered_users = set()
-
-    # Initialize Text-to-Speech Engine
-    try:
-      self.engine = pyttsx3.init()
-      self.engine.setProperty("rate", 150)
-    except Exception:
-      self.engine = None
 
     # --- Layout Grid ---
     self.grid_columnconfigure(0, weight=3)  # Video Area
@@ -210,7 +204,9 @@ class SmartSecurityApp(ctk.CTk):
     )
     self.log_textbox.grid(row=4, column=0, padx=20, pady=(0, 20), sticky="nsew")
     self.log_textbox.insert(
-        "0.0", "System initialized successfully.\nReady to start...\n"
+        "0.0",
+        "System initialized successfully.\nPlaysound background audio &"
+        " RealSense ready...\n",
     )
     self.log_textbox.configure(state="disabled")
 
@@ -221,13 +217,21 @@ class SmartSecurityApp(ctk.CTk):
     self.log_textbox.see("end")
     self.log_textbox.configure(state="disabled")
 
-  def speak(self, text):
-    if self.engine:
-      try:
-        self.engine.say(text)
-        self.engine.runAndWait()
-      except Exception:
-        pass
+  # Background Audio Playback using playsound (No media player window pop-up!)
+  def speak(self, text, lang="ja"):
+    try:
+      tts = gTTS(text=text, lang=lang)
+      temp_audio = f"temp_speech_{int(time.time() * 1000)}.mp3"
+      tts.save(temp_audio)
+
+      # Play sound silently in background
+      playsound(temp_audio)
+
+      # Clean up temp file
+      if os.path.exists(temp_audio):
+        os.remove(temp_audio)
+    except Exception as e:
+      self.log_message(f"Audio Playback Error: {str(e)}")
 
   def send_email_alert(self, subject, image_path):
     active_recipients = [
@@ -267,14 +271,22 @@ class SmartSecurityApp(ctk.CTk):
   def start_system(self):
     if self.running:
       return
-    self.cap = cv2.VideoCapture(0)
+
+    camera_index = 2
+    self.cap = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
     if not self.cap.isOpened():
-      messagebox.showerror("Error", "Could not open webcam.")
+      self.cap = cv2.VideoCapture(camera_index)
+    if not self.cap.isOpened():
+      self.cap = cv2.VideoCapture(1)
+
+    if not self.cap.isOpened():
+      messagebox.showerror(
+          "Error", "Could not open Intel RealSense D435i camera."
+      )
       return
 
     self.running = True
     self.start_time = time.time()
-    # Reset tracking sets on system start
     self.welcomed_registered_users.clear()
     self.emailed_registered_users.clear()
     self.unknown_last_alert = 0
@@ -285,7 +297,7 @@ class SmartSecurityApp(ctk.CTk):
     )
     self.start_btn.configure(state="disabled")
     self.stop_btn.configure(state="normal")
-    self.log_message("System started.")
+    self.log_message("System started with playsound background audio.")
 
     self.thread = threading.Thread(target=self.video_loop, daemon=True)
     self.thread.start()
@@ -317,16 +329,19 @@ class SmartSecurityApp(ctk.CTk):
       current_time = time.time()
 
       for face_encoding, face_location in zip(face_encodings, face_locations):
-        matches = face_recognition.compare_faces(
-            known_face_encodings, face_encoding
-        )
         name = "Unknown"
 
-        if True in matches:
-          first_match_index = matches.index(True)
-          name = known_face_names[first_match_index]
+        if known_face_encodings:
+          face_distances = face_recognition.face_distance(
+              known_face_encodings, face_encoding
+          )
+          best_match_index = np.argmin(face_distances)
+          if face_distances[best_match_index] < 0.45:
+            name = known_face_names[best_match_index]
 
-          top, right, bottom, left = [v * 4 for v in face_location]
+        top, right, bottom, left = [v * 4 for v in face_location]
+
+        if name != "Unknown":
           cv2.rectangle(frame, (left, top), (right, bottom), (0, 255, 0), 2)
           cv2.putText(
               frame,
@@ -338,17 +353,19 @@ class SmartSecurityApp(ctk.CTk):
               2,
           )
 
-          # 1. Voice Greeting: Exactly ONE time per session for this registered user
+          # 1. Full Japanese Greeting Speech (Background audio via playsound)
           if name not in self.welcomed_registered_users:
             self.welcomed_registered_users.add(name)
-            # Correct Japanese structure: "Irasshaimase [Name] san"
-            greeting_text = f"いらっしゃいませ {name} さん"
+            greeting_text = (
+                f"いらっしゃいませ〜 {name}"
+                f"さん、今日も頑張ってくださいね。"
+            )
             threading.Thread(
-                target=self.speak, args=(greeting_text,), daemon=True
+                target=self.speak, args=(greeting_text, "ja"), daemon=True
             ).start()
-            self.log_message(f"Welcomed: {name}")
+            self.log_message(f"Welcomed silently in background: {name}")
 
-          # 2. Email Alert: Exactly ONE time per session for this registered user
+          # 2. Email Alert (Once per session)
           if name not in self.emailed_registered_users:
             self.emailed_registered_users.add(name)
             cv2.imwrite(TEMP_IMAGE, frame)
@@ -359,7 +376,6 @@ class SmartSecurityApp(ctk.CTk):
             self.log_message(f"Email sent for Known Visitor: {name}")
 
         else:
-          top, right, bottom, left = [v * 4 for v in face_location]
           cv2.rectangle(frame, (left, top), (right, bottom), (0, 0, 255), 2)
           cv2.putText(
               frame,
@@ -371,15 +387,15 @@ class SmartSecurityApp(ctk.CTk):
               2,
           )
 
-          # Unknown face voice every 10 seconds
           if current_time - self.unknown_last_alert >= 10:
             self.unknown_last_alert = current_time
             threading.Thread(
-                target=self.speak, args=("誰さんですか",), daemon=True
+                target=self.speak, args=("誰さんですか。", "ja"), daemon=True
             ).start()
-            self.log_message("Unknown visitor detected: Spoken ('誰さんですか').")
+            self.log_message(
+                "Unknown visitor detected: Spoken ('誰さんですか。')."
+            )
 
-          # Unknown face email every 30 seconds
           if current_time - self.last_unknown_email_time >= 30:
             self.last_unknown_email_time = current_time
             cv2.imwrite(TEMP_IMAGE, frame)
@@ -387,7 +403,9 @@ class SmartSecurityApp(ctk.CTk):
                 target=self.send_email_alert,
                 args=("Unknown Intruder / Visitor Alert", TEMP_IMAGE),
             ).start()
-            self.log_message("Unknown visitor detected: Email sent (30s interval).")
+            self.log_message(
+                "Unknown visitor detected: Email sent (30s interval)."
+            )
 
       cv2_image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
       pil_image = Image.fromarray(cv2_image)
@@ -418,15 +436,25 @@ class SmartSecurityApp(ctk.CTk):
 
     lbl_info = ctk.CTkLabel(
         reg_win,
-        text=f"Position your face clearly, then click 'Capture & Train'.",
-        font=ctk.CTkFont(size=14, weight="bold"),
+        text=(
+            "Position your face clearly. We will capture multiple samples for"
+            " high ML accuracy."
+        ),
+        font=ctk.CTkFont(size=13, weight="bold"),
     )
     lbl_info.pack(padx=20, pady=10)
 
-    cam_lbl = ctk.CTkLabel(reg_win, text="Loading Camera...", width=480, height=320)
+    cam_lbl = ctk.CTkLabel(
+        reg_win, text="Loading Camera...", width=480, height=320
+    )
     cam_lbl.pack(padx=20, pady=5)
 
-    cap = cv2.VideoCapture(0)
+    cap = cv2.VideoCapture(2, cv2.CAP_DSHOW)
+    if not cap.isOpened():
+      cap = cv2.VideoCapture(2)
+    if not cap.isOpened():
+      cap = cv2.VideoCapture(1)
+
     capturing_active = [True]
 
     def update_reg_preview():
@@ -449,40 +477,47 @@ class SmartSecurityApp(ctk.CTk):
 
     def capture_and_process():
       capturing_active[0] = False
-      ret, frame = cap.read()
+      collected_encodings = []
+      for _ in range(5):
+        ret, frame = cap.read()
+        if ret:
+          rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+          encs = face_recognition.face_encodings(rgb_frame)
+          if encs:
+            collected_encodings.append(encs[0])
+        time.sleep(0.3)
+
       cap.release()
 
-      if ret:
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        encodings = face_recognition.face_encodings(rgb_frame)
-        if encodings:
-          timestamp_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-          known_face_encodings.append(encodings[0])
+      if collected_encodings:
+        timestamp_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        for enc in collected_encodings:
+          known_face_encodings.append(enc)
           known_face_names.append(name)
           face_timestamps.append(timestamp_str)
-          save_encodings()
 
-          messagebox.showinfo(
-              "Success", f"Successfully Done!\nFace registered for {name}."
-          )
-          self.log_message(
-              f"Successfully Done: New face added -> {name} at {timestamp_str}"
-          )
-          reg_win.destroy()
-        else:
-          messagebox.showerror(
-              "Error / Failed",
-              "Could not detect a face clearly!\nPlease try again and"
-              " position properly.",
-          )
-          reg_win.destroy()
+        save_encodings()
+        messagebox.showinfo(
+            "Success",
+            f"Successfully Done!\nCaptured {len(collected_encodings)} ML samples"
+            f" for {name}.",
+        )
+        self.log_message(
+            f"Successfully Done: Added {len(collected_encodings)} face encodings"
+            f" -> {name}"
+        )
+        reg_win.destroy()
       else:
-        messagebox.showerror("Error", "Failed to capture image from camera.")
+        messagebox.showerror(
+            "Error / Failed",
+            "Could not detect a face clearly!\nPlease try again and position"
+            " properly.",
+        )
         reg_win.destroy()
 
     capture_btn = ctk.CTkButton(
         reg_win,
-        text="📸 Capture & Train",
+        text="📸 Capture & Train (Multi-Sample)",
         command=capture_and_process,
         fg_color="#2fa572",
         hover_color="#248259",
@@ -517,12 +552,14 @@ class SmartSecurityApp(ctk.CTk):
         )
         lbl.pack(pady=20)
       else:
-        for i, name in enumerate(known_face_names):
-          ts = (
-              face_timestamps[i]
-              if i < len(face_timestamps)
-              else "Unknown Date"
-          )
+        unique_names = sorted(list(set(known_face_names)))
+        for i, name in enumerate(unique_names):
+          ts = "Registered"
+          for idx, n in enumerate(known_face_names):
+            if n == name and idx < len(face_timestamps):
+              ts = face_timestamps[idx]
+              break
+
           item_frame = ctk.CTkFrame(scroll_frame, fg_color=("gray90", "gray20"))
           item_frame.pack(padx=5, pady=5, fill="x")
 
@@ -541,24 +578,32 @@ class SmartSecurityApp(ctk.CTk):
               height=28,
               fg_color="#d9534f",
               hover_color="#b52b27",
-              command=lambda idx=i, n=name: delete_face_index(idx, n),
+              command=lambda n=name: delete_face_by_name(n),
           )
           del_btn.pack(side="right", padx=10, pady=6)
 
-    def delete_face_index(idx, name):
+    def delete_face_by_name(name):
       if messagebox.askyesno(
-          "Confirm Delete", f"Are you sure you want to delete '{name}'?"
+          "Confirm Delete",
+          f"Are you sure you want to delete all samples for '{name}'?",
       ):
-        if idx < len(known_face_encodings):
-          known_face_encodings.pop(idx)
-        if idx < len(known_face_names):
-          known_face_names.pop(idx)
-        if idx < len(face_timestamps):
-          face_timestamps.pop(idx)
+        global known_face_encodings, known_face_names, face_timestamps
+        new_encs, new_names, new_ts = [], [], []
+        for enc, n, t in zip(
+            known_face_encodings, known_face_names, face_timestamps
+        ):
+          if n != name:
+            new_encs.append(enc)
+            new_names.append(n)
+            new_ts.append(t)
+
+        known_face_encodings = new_encs
+        known_face_names = new_names
+        face_timestamps = new_ts
 
         save_encodings()
         refresh_history_list()
-        self.log_message(f"Deleted registered face: {name}")
+        self.log_message(f"Deleted all face records for: {name}")
 
     refresh_history_list()
 

@@ -83,10 +83,13 @@ class SmartSecurityApp(ctk.CTk):
     # State variables
     self.running = False
     self.cap = None
-    self.last_alert_time = {}
     self.unknown_last_alert = 0
+    self.last_unknown_email_time = 0
     self.start_time = None
-    self.last_detected_person = None  # To instantly track face changes
+
+    # Track session-based alerts to strictly prevent duplicate emails/voice for known users
+    self.welcomed_registered_users = set()
+    self.emailed_registered_users = set()
 
     # Initialize Text-to-Speech Engine
     try:
@@ -181,7 +184,7 @@ class SmartSecurityApp(ctk.CTk):
 
     self.history_btn = ctk.CTkButton(
         self.mgmt_frame,
-        text="📋 View Face History",
+        text="📋 View & Manage Face History",
         command=self.view_face_history_gui,
         height=35,
         fg_color="#3b82f6",
@@ -271,6 +274,12 @@ class SmartSecurityApp(ctk.CTk):
 
     self.running = True
     self.start_time = time.time()
+    # Reset tracking sets on system start
+    self.welcomed_registered_users.clear()
+    self.emailed_registered_users.clear()
+    self.unknown_last_alert = 0
+    self.last_unknown_email_time = 0
+
     self.status_badge.configure(
         text=" ● System Status: RUNNING ", text_color="#2fa572"
     )
@@ -306,7 +315,6 @@ class SmartSecurityApp(ctk.CTk):
       )
 
       current_time = time.time()
-      current_frame_person = None
 
       for face_encoding, face_location in zip(face_encodings, face_locations):
         matches = face_recognition.compare_faces(
@@ -317,7 +325,6 @@ class SmartSecurityApp(ctk.CTk):
         if True in matches:
           first_match_index = matches.index(True)
           name = known_face_names[first_match_index]
-          current_frame_person = name
 
           top, right, bottom, left = [v * 4 for v in face_location]
           cv2.rectangle(frame, (left, top), (right, bottom), (0, 255, 0), 2)
@@ -331,24 +338,27 @@ class SmartSecurityApp(ctk.CTk):
               2,
           )
 
-          # If person changes or hasn't been alerted recently
-          if (
-              name != self.last_detected_person
-              or name not in self.last_alert_time
-          ):
-            self.last_alert_time[name] = current_time
-            cv2.imwrite(TEMP_IMAGE, frame)
+          # 1. Voice Greeting: Exactly ONE time per session for this registered user
+          if name not in self.welcomed_registered_users:
+            self.welcomed_registered_users.add(name)
+            # Correct Japanese structure: "Irasshaimase [Name] san"
+            greeting_text = f"いらっしゃいませ {name} さん"
             threading.Thread(
-                target=self.speak, args=(f"いらっしゃいませ {name} さん",)
+                target=self.speak, args=(greeting_text,), daemon=True
             ).start()
+            self.log_message(f"Welcomed: {name}")
+
+          # 2. Email Alert: Exactly ONE time per session for this registered user
+          if name not in self.emailed_registered_users:
+            self.emailed_registered_users.add(name)
+            cv2.imwrite(TEMP_IMAGE, frame)
             threading.Thread(
                 target=self.send_email_alert,
                 args=(f"Known Visitor Alert: {name}", TEMP_IMAGE),
             ).start()
-            self.log_message(f"Recognized & Welcomed: {name}")
+            self.log_message(f"Email sent for Known Visitor: {name}")
 
         else:
-          current_frame_person = "Unknown"
           top, right, bottom, left = [v * 4 for v in face_location]
           cv2.rectangle(frame, (left, top), (right, bottom), (0, 0, 255), 2)
           cv2.putText(
@@ -361,31 +371,23 @@ class SmartSecurityApp(ctk.CTk):
               2,
           )
 
-          # Unknown person logic: every 10s voice, every 30s email
+          # Unknown face voice every 10 seconds
           if current_time - self.unknown_last_alert >= 10:
             self.unknown_last_alert = current_time
+            threading.Thread(
+                target=self.speak, args=("誰さんですか",), daemon=True
+            ).start()
+            self.log_message("Unknown visitor detected: Spoken ('誰さんですか').")
+
+          # Unknown face email every 30 seconds
+          if current_time - self.last_unknown_email_time >= 30:
+            self.last_unknown_email_time = current_time
             cv2.imwrite(TEMP_IMAGE, frame)
             threading.Thread(
-                target=self.speak, args=("誰さんですか",)
+                target=self.send_email_alert,
+                args=("Unknown Intruder / Visitor Alert", TEMP_IMAGE),
             ).start()
-
-            # Email every 30 seconds for unknown
-            if (
-                not hasattr(self, "last_unknown_email_time")
-                or current_time - self.last_unknown_email_time >= 30
-            ):
-              self.last_unknown_email_time = current_time
-              threading.Thread(
-                  target=self.send_email_alert,
-                  args=("Unknown Intruder / Visitor Alert", TEMP_IMAGE),
-              ).start()
-              self.log_message(
-                  "Unknown visitor detected: Spoken & Email sent (30s interval)."
-              )
-            else:
-              self.log_message("Unknown visitor detected: Spoken only (10s interval).")
-
-      self.last_detected_person = current_frame_person
+            self.log_message("Unknown visitor detected: Email sent (30s interval).")
 
       cv2_image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
       pil_image = Image.fromarray(cv2_image)
@@ -401,7 +403,6 @@ class SmartSecurityApp(ctk.CTk):
       self.video_label.configure(image=imgtk, text="")
       self.video_label.image = imgtk
 
-  # --- Add Face Feature with Live Preview & Success Status ---
   def add_face_gui(self):
     dialog = ctk.CTkInputDialog(
         text="Enter visitor's name:", title="Register Face"
@@ -410,7 +411,6 @@ class SmartSecurityApp(ctk.CTk):
     if not name:
       return
 
-    # Create a Toplevel window to show live camera feed for registration
     reg_win = ctk.CTkToplevel(self)
     reg_win.title(f"Registering Face: {name}")
     reg_win.geometry("550x500")
@@ -493,8 +493,8 @@ class SmartSecurityApp(ctk.CTk):
 
   def view_face_history_gui(self):
     history_win = ctk.CTkToplevel(self)
-    history_win.title("Registered Face History")
-    history_win.geometry("450x400")
+    history_win.title("Registered Face History & Management")
+    history_win.geometry("500x450")
     history_win.grab_set()
 
     title_lbl = ctk.CTkLabel(
@@ -504,33 +504,63 @@ class SmartSecurityApp(ctk.CTk):
     )
     title_lbl.pack(padx=20, pady=(20, 10))
 
-    scroll_frame = ctk.CTkScrollableFrame(history_win, width=400, height=280)
+    scroll_frame = ctk.CTkScrollableFrame(history_win, width=440, height=300)
     scroll_frame.pack(padx=20, pady=10, fill="both", expand=True)
 
-    if not known_face_names:
-      lbl = ctk.CTkLabel(scroll_frame, text="No registered faces found.")
-      lbl.pack(pady=20)
-    else:
-      for i, name in enumerate(known_face_names):
-        ts = (
-            face_timestamps[i]
-            if i < len(face_timestamps)
-            else "Unknown Date"
-        )
-        item_frame = ctk.CTkFrame(scroll_frame, fg_color=("gray90", "gray20"))
-        item_frame.pack(padx=5, pady=5, fill="x")
+    def refresh_history_list():
+      for widget in scroll_frame.winfo_children():
+        widget.destroy()
 
-        name_lbl = ctk.CTkLabel(
-            item_frame,
-            text=f"👤 {name}",
-            font=ctk.CTkFont(size=13, weight="bold"),
+      if not known_face_names:
+        lbl = ctk.CTkLabel(
+            scroll_frame, text="No registered faces found.", text_color="gray"
         )
-        name_lbl.pack(side="left", padx=10, pady=8)
+        lbl.pack(pady=20)
+      else:
+        for i, name in enumerate(known_face_names):
+          ts = (
+              face_timestamps[i]
+              if i < len(face_timestamps)
+              else "Unknown Date"
+          )
+          item_frame = ctk.CTkFrame(scroll_frame, fg_color=("gray90", "gray20"))
+          item_frame.pack(padx=5, pady=5, fill="x")
 
-        time_lbl = ctk.CTkLabel(
-            item_frame, text=f"🕒 {ts}", text_color="gray"
-        )
-        time_lbl.pack(side="right", padx=10, pady=8)
+          info_text = f"👤 {name}   🕒 {ts}"
+          info_lbl = ctk.CTkLabel(
+              item_frame,
+              text=info_text,
+              font=ctk.CTkFont(size=12, weight="bold"),
+          )
+          info_lbl.pack(side="left", padx=10, pady=8)
+
+          del_btn = ctk.CTkButton(
+              item_frame,
+              text="🗑️ Delete",
+              width=70,
+              height=28,
+              fg_color="#d9534f",
+              hover_color="#b52b27",
+              command=lambda idx=i, n=name: delete_face_index(idx, n),
+          )
+          del_btn.pack(side="right", padx=10, pady=6)
+
+    def delete_face_index(idx, name):
+      if messagebox.askyesno(
+          "Confirm Delete", f"Are you sure you want to delete '{name}'?"
+      ):
+        if idx < len(known_face_encodings):
+          known_face_encodings.pop(idx)
+        if idx < len(known_face_names):
+          known_face_names.pop(idx)
+        if idx < len(face_timestamps):
+          face_timestamps.pop(idx)
+
+        save_encodings()
+        refresh_history_list()
+        self.log_message(f"Deleted registered face: {name}")
+
+    refresh_history_list()
 
   def manage_emails_gui(self):
     email_win = ctk.CTkToplevel(self)

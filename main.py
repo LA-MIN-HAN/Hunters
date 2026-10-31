@@ -390,10 +390,10 @@ class SmartSecurityApp(ctk.CTk):
           if current_time - self.unknown_last_alert >= 10:
             self.unknown_last_alert = current_time
             threading.Thread(
-                target=self.speak, args=("誰さんですか。", "ja"), daemon=True
+                target=self.speak, args=("どなたですか。", "ja"), daemon=True
             ).start()
             self.log_message(
-                "Unknown visitor detected: Spoken ('誰さんですか。')."
+                "Unknown visitor detected: Spoken ('どなたですか。')."
             )
 
           if current_time - self.last_unknown_email_time >= 30:
